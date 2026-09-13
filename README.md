@@ -7,6 +7,26 @@ continuous-time deconvolution as the primary temporal analyses.
 Extracted from the larger `ev_analysis` scripts repo so the SAE pipeline can
 live and version on its own.
 
+## Related: Tuckute et al. 2D space (distinct from this repo’s Lepori path)
+
+> **Not the same analysis as Lepori `full` / `content` / `surprisal_only`.**
+> Project SAE also includes an **intentional, method-matched** attempt to
+> replicate Tuckute, Lee, Ou, Fedorenko & Kay
+> ([bioRxiv 10.1101/2025.05.21.655330](https://www.biorxiv.org/content/10.1101/2025.05.21.655330v1)) —
+> *A two-dimensional space of linguistic representations shared across
+> individuals* — where **PC1 ≈ processing difficulty** and
+> **PC2 ≈ meaning abstractness** (Sentence/Word PCs).
+>
+> That work lives under sibling **`ev_analysis/tuckute_*`** runners with
+> outputs in **`group_encoding_results/tuckute_*`**. It is **method-matched**
+> (shared-stimulus decomposition + difficulty/abstractness axes), **not** a
+> stimulus-matched 7T English fMRI copy. Under preregistered criteria, results
+> **largely failed to recover** a shared generalizing 2D space.
+>
+> This repo’s Lepori SAE contrasts remain separate and should not be read as
+> that paper’s difficulty–abstractness Sentence-PC claim. See
+> [`ev_analysis/tuckute_2d/README.md`](../ev_analysis/tuckute_2d/README.md).
+
 ## Layout
 
 ```
@@ -52,6 +72,8 @@ See `sparse_encoding/README_TEMPORAL.md` for lag / kernel interpretation.
 | `sae_qwen35_4b_mat_l15` | Qwen3.5-4B-Base Chanin Matryoshka L15 | Primary hierarchical SAE |
 | `sae_qwen3_8b_l18` | Qwen3-8B layer 18 | Chinese companion |
 | `sae_gemma2_2b_mat_l12` | Gemma-2-2B Matryoshka L12 | Paper backbone (method check) |
+
+> **Neuronpedia caveat (Base vs non-Base):** Local run uses **Qwen3.5-4B-Base** + Base Matryoshka L15 SAE; Neuronpedia hosts the sibling **non-Base** dictionary (`qwen3.5-4b/15-res-matryoshka-65k`). Same family, separately trained — **feature indices may drift** when interpreting selected IDs via Neuronpedia.
 
 ## Tests
 
