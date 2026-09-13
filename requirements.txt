@@ -1,0 +1,15 @@
+# Core
+numpy
+pandas
+matplotlib
+scipy
+h5py
+scikit-learn
+
+# Optional — SAE feature extraction (GPU)
+# torch
+# transformers
+# sae_lens
+
+# Dev
+pytest
