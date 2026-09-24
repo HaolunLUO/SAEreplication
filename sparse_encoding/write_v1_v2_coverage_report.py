@@ -17,7 +17,6 @@ OUT = V2 / "reports" / "v1_vs_v2_coverage.md"
 
 TAGS = (
     ("Qwen3.5 L15", "sae_qwen35_4b_mat_l15"),
-    ("Qwen3-8B L18", "sae_qwen3_8b_l18"),
 )
 
 
@@ -78,8 +77,9 @@ def main() -> None:
     add("those token SAE activations (SAE, then mean). Surprisal uses the same")
     add("weights. v1 remains unique-final-word. v1 npz, meta, tables, and reports")
     add("were not overwritten. v2 features are `X_word_<tag>_v2.*`. Regression")
-    add("tables are under `group_encoding_results/sparse_encoding_v2/`.")
-    add("")
+add("tables are under `group_encoding_results/sparse_encoding_v2/`.")
+add("Qwen3-8B L18 and Gemma-2-2B were not re-extracted or re-regressed.")
+add("")
     add("SAE gain is full Fisher-z *r* minus surprisal-only Fisher-z *r*,")
     add("then averaged within subject and across subjects. The headline rows")
     add("are the Study 3 subject means (`paper_sae_gain_subject_mean`), which")
@@ -142,7 +142,7 @@ def main() -> None:
     if sign_changes:
         add("Sign changes: " + ", ".join(sign_changes) + ".")
     else:
-        add("No sign change in subject-mean SAE gain (all channels or is_lang) for the Qwen backbones.")
+        add("No sign change in subject-mean SAE gain (all channels or is_lang) for Qwen3.5 L15.")
     add("")
     add("## Qwen3.5 early-bin occupancy and lang refits")
     add("")

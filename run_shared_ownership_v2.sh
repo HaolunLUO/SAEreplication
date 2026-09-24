@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Shared-token ownership v2 for the Qwen backbones only.
-# Primary: Qwen3.5-4B-Base Matryoshka L15. Companion: Qwen3-8B L18.
-# Gemma-2-2B is not extracted or regressed.
+# Shared-token ownership v2 for Qwen3.5-4B-Base Matryoshka L15 only.
+# Qwen3-8B L18 and Gemma-2-2B are not extracted or regressed.
 # Writes X_word_<tag>_v2.* next to v1 features and tables under
 # group_encoding_results/sparse_encoding_v2/. Does not overwrite v1 npz/meta
 # or v1 sparse_encoding tables.
@@ -69,11 +68,10 @@ extract_preset() {
 
 echo "=== $(date -Iseconds) shared-ownership alignment QC ==="
 "${EXTRACT_PY}" -m sparse_encoding.sparse_encoding_validate \
-  --stage align --models qwen qwen35 \
+  --stage align --models qwen35 \
   --ownership shared_char_weighted
 
 extract_preset qwen35_4b_mat_l15 1 2 3
-extract_preset qwen3_8b_l18 1 2 3
 
 regress_cohort_lang() {
   local tag="$1"
@@ -105,10 +103,8 @@ regress_bin() {
 }
 
 QWEN35="sae_qwen35_4b_mat_l15_v2"
-QWEN="sae_qwen3_8b_l18_v2"
 
 regress_cohort_lang "${QWEN35}"
-regress_cohort_lang "${QWEN}"
 
 regress_bin "${QWEN35}" 0 2048 "${N_JOBS}"
 regress_bin "${QWEN35}" 2048 "" "${N_JOBS_WIDE}"
@@ -120,10 +116,6 @@ echo "=== $(date -Iseconds) residual baselines ==="
   --features "${QWEN35}_resid" --surprisal_tag "${QWEN35}" \
   --with_surprisal --lang_only --out_suffix _qwen35_v2_resid \
   --n_jobs 1 --resume
-"${REGRESS_PY}" -m sparse_encoding.sparse_encoding_dense_baseline \
-  --features "${QWEN}_resid" --surprisal_tag "${QWEN}" \
-  --with_surprisal --lang_only --out_suffix _qwen_v2_resid \
-  --n_jobs 1 --resume
 
 echo "=== $(date -Iseconds) Qwen3.5 qualitative (bin occupancy) ==="
 "${REGRESS_PY}" -m sparse_encoding.sparse_encoding_qualitative \
@@ -134,6 +126,6 @@ echo "=== $(date -Iseconds) Qwen3.5 qualitative (bin occupancy) ==="
 
 echo "=== $(date -Iseconds) Study 3 analogue ==="
 "${REGRESS_PY}" -m sparse_encoding.sparse_encoding_lepori_study3 \
-  --tag_suffix _v2 --skip_gemma
+  --tag_suffix _v2 --skip_gemma --skip_qwen
 
 echo "=== ALL DONE $(date -Iseconds) ==="
