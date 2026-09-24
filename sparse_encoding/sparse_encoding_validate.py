@@ -45,7 +45,9 @@ import pandas as pd
 
 import core.analysis_paths as ap
 from sparse_encoding.sae_extract_features import (
-    assign_tokens_to_words, build_section_text, alignment_report,
+    OWNERSHIP_SHARED, OWNERSHIP_UNIQUE,
+    alignment_report, assign_tokens_shared_char_weighted,
+    assign_tokens_to_words, build_section_text, feature_tag_for_ownership,
 )
 from sparse_encoding.sparse_encoding_summary import (
     LEFT_MFG_REGION, bootstrap_subject_means, language_mask, merge_taxonomy,
@@ -103,14 +105,20 @@ def run(cmd: list[str], check: bool = True) -> int:
     return r.returncode
 
 
-def stage_align(models: list[dict], sections: list[int]) -> Path:
-    """Tokenizer-only unique-ownership report for each model."""
+def stage_align(
+    models: list[dict],
+    sections: list[int],
+    ownership: str = OWNERSHIP_UNIQUE,
+) -> Path:
+    """Tokenizer-only ownership report. Shared mode uses the v2 rule and root."""
     from transformers import AutoTokenizer
 
     ap.ensure_pipeline_dirs()
+    shared_mode = ownership == OWNERSHIP_SHARED
     rows = []
     for cfg in models:
-        print(f"\n[align] {cfg['feature_tag']} / {cfg['model_name']}")
+        tag = feature_tag_for_ownership(cfg["feature_tag"], ownership)
+        print(f"\n[align] {tag} / {cfg['model_name']} ownership={ownership}")
         tok = AutoTokenizer.from_pretrained(
             cfg["model_name"],
             trust_remote_code=bool(cfg.get("trust_remote_code")),
@@ -119,29 +127,69 @@ def stage_align(models: list[dict], sections: list[int]) -> Path:
             wt = pd.read_csv(ap.FEATURES_DIR / f"section_{sid:03d}" / "word_timing.csv")
             sect = build_section_text(wt)
             enc = tok(sect.text, return_offsets_mapping=True, add_special_tokens=False)
-            tpw, owner = assign_tokens_to_words(enc["offset_mapping"], sect.word_spans)
-            rep = alignment_report(tpw, owner)
-            seen = []
-            for toks in tpw:
-                seen.extend(toks)
-            assert len(seen) == len(set(seen)), "shared tokens detected"
-            rows.append({"feature_tag": cfg["feature_tag"], "section": sid, **rep})
+            if shared_mode:
+                assigned = assign_tokens_shared_char_weighted(
+                    enc["offset_mapping"], sect.word_spans)
+                rep = alignment_report(
+                    assigned.tokens_per_word,
+                    weights_per_word=assigned.weights_per_word,
+                )
+                rep["shared_token_count"] = int(assigned.n_shared_tokens)
+                rep["shared_token_word_count"] = int(sum(assigned.shared_token))
+                if rep["ownership_mismatch_words"] != 0:
+                    raise AssertionError(
+                        f"shared ownership mismatches: {rep['ownership_mismatch_words']}"
+                    )
+            else:
+                tpw, owner = assign_tokens_to_words(
+                    enc["offset_mapping"], sect.word_spans)
+                rep = alignment_report(tpw, owner)
+                seen = []
+                for toks in tpw:
+                    seen.extend(toks)
+                assert len(seen) == len(set(seen)), "shared tokens detected"
+            rows.append({
+                "feature_tag": tag,
+                "section": sid,
+                "token_ownership": ownership,
+                **rep,
+            })
             print(f"  section {sid}: {rep}")
-    out = ap.SAE_REPORTS / "sparse_encoding_alignment_repair.txt"
+    if shared_mode:
+        # Never write this QC into the v1 sparse_encoding reports directory.
+        root = ap.RESULTS_ROOT / "sparse_encoding_v2"
+        reports = root / "reports"
+        tables = root / "tables"
+        reports.mkdir(parents=True, exist_ok=True)
+        tables.mkdir(parents=True, exist_ok=True)
+        out = reports / "sparse_encoding_alignment_shared_v2.txt"
+        csv_path = tables / "sparse_encoding_alignment_shared_v2.csv"
+        title = "SHARED CHAR-WEIGHTED TOKEN OWNERSHIP — ALIGNMENT CHECK"
+    else:
+        out = ap.SAE_REPORTS / "sparse_encoding_alignment_repair.txt"
+        csv_path = ap.SAE_TABLES / "sparse_encoding_alignment_repair.csv"
+        title = "UNIQUE TOKEN OWNERSHIP — ALIGNMENT CHECK"
     df = pd.DataFrame(rows)
-    lines = ["UNIQUE TOKEN OWNERSHIP — ALIGNMENT CHECK", "=" * 60, df.to_string(index=False)]
+    lines = [title, "=" * 60, df.to_string(index=False)]
     out.write_text("\n".join(lines))
-    df.to_csv(ap.SAE_TABLES / "sparse_encoding_alignment_repair.csv", index=False)
+    df.to_csv(csv_path, index=False)
     print(f"Wrote {out}")
     return out
 
 
-def stage_extract(models: list[dict], sections: list[int], device: str, dtype: str):
+def stage_extract(
+    models: list[dict],
+    sections: list[int],
+    device: str,
+    dtype: str,
+    ownership: str = OWNERSHIP_UNIQUE,
+):
     for cfg in models:
         if cfg.get("preset"):
             cmd = [
                 PY, "-m", "sparse_encoding.sae_extract_features",
                 "--preset", cfg["preset"],
+                "--ownership", ownership,
                 "--device", device,
                 "--dtype", dtype if device == "cuda" else "float32",
                 "--sections", *[str(s) for s in sections],
@@ -153,7 +201,8 @@ def stage_extract(models: list[dict], sections: list[int], device: str, dtype: s
                 "--sae_release", cfg["sae_release"],
                 "--sae_id", cfg["sae_id"],
                 "--sae_layer", str(cfg["sae_layer"]),
-                "--feature_tag", cfg["feature_tag"],
+                "--feature_tag", feature_tag_for_ownership(cfg["feature_tag"], ownership),
+                "--ownership", ownership,
                 "--aggregation", "mean",
                 "--device", device,
                 "--dtype", dtype if device == "cuda" else "float32",
@@ -523,6 +572,12 @@ def parse_args():
                    help="Use full SUBJECTS map (ignores --subjects).")
     p.add_argument("--lang_only", action=argparse.BooleanOptionalAction, default=True,
                    help="Lang-only electrodes for temporal stages (default on).")
+    p.add_argument(
+        "--ownership",
+        choices=[OWNERSHIP_UNIQUE, OWNERSHIP_SHARED],
+        default=OWNERSHIP_UNIQUE,
+        help="Token→word rule for align/extract. shared_char_weighted is v2.",
+    )
     return p.parse_args()
 
 
@@ -537,10 +592,20 @@ def main():
     subjects = None if args.all_subjects else args.subjects
 
     t0 = time.time()
+    if args.ownership == OWNERSHIP_SHARED:
+        rewritten = []
+        for cfg in models:
+            cfg = dict(cfg)
+            cfg["feature_tag"] = feature_tag_for_ownership(
+                cfg["feature_tag"], args.ownership)
+            rewritten.append(cfg)
+        models = rewritten
     if "align" in stages:
-        stage_align(models, args.sections)
+        stage_align(models, args.sections, ownership=args.ownership)
     if "extract" in stages:
-        stage_extract(models, args.sections, args.device, args.dtype)
+        stage_extract(
+            models, args.sections, args.device, args.dtype,
+            ownership=args.ownership)
     if "smoke" in stages:
         stage_smoke(models, args.subjects, args.max_channels or 4, args.sections)
     if "temporal_full" in stages:

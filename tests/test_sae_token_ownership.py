@@ -16,8 +16,11 @@ if str(ROOT) not in sys.path:
 from sparse_encoding.sae_extract_features import (
     adjacent_duplicate_row_rate,
     aggregate_owned_token_sae,
+    alignment_report,
+    assign_tokens_shared_char_weighted,
     assign_tokens_to_words,
     build_section_text,
+    parse_args,
 )
 
 
@@ -112,6 +115,71 @@ def test_tagged_surprisal_paths_do_not_collide(tmp_path, monkeypatch=None):
     assert float(np.load(q).ravel()[0]) == 9.0
 
 
+def test_shared_char_weighted_de_shihou():
+    """Token 的时候 over words 的 / 时候: weights 1/3 and 2/3, full coverage."""
+    word_spans = [(0, 1), (1, 3)]  # 的 | 时候
+    offsets = [(0, 3)]
+    assigned = assign_tokens_shared_char_weighted(offsets, word_spans)
+    assert assigned.tokens_per_word == [[0], [0]]
+    assert np.isclose(assigned.weights_per_word[0][0], 1.0 / 3.0)
+    assert np.isclose(assigned.weights_per_word[1][0], 2.0 / 3.0)
+    assert assigned.shared_token == [True, True]
+    assert assigned.n_shared_tokens == 1
+    rep = alignment_report(
+        assigned.tokens_per_word, weights_per_word=assigned.weights_per_word)
+    assert rep["coverage_pct"] == 100.0
+    assert rep["words_with_0_tokens"] == 0
+    assert rep["ownership_mismatch_words"] == 0
+
+    token_lat = np.array([[3.0, 0.0, 6.0]], dtype=np.float32)
+    surprisal_tok = np.array([1.5], dtype=np.float32)
+    lat, surp, valid, stats = aggregate_owned_token_sae(
+        token_lat, surprisal_tok, assigned.tokens_per_word,
+        weights_per_word=assigned.weights_per_word)
+    assert valid.tolist() == [True, True]
+    assert np.allclose(lat[0].toarray(), [[3.0, 0.0, 6.0]])
+    assert np.allclose(lat[1].toarray(), [[3.0, 0.0, 6.0]])
+    assert np.isclose(surp[0], 1.5) and np.isclose(surp[1], 1.5)
+    assert stats["surprisal_imputation_count"] == 0
+
+
+def test_shared_weight_normalized_mean():
+    token_lat = np.array([[3.0, 0.0], [0.0, 9.0]], dtype=np.float32)
+    surprisal_tok = np.array([3.0, 9.0], dtype=np.float32)
+    lat, surp, valid, _stats = aggregate_owned_token_sae(
+        token_lat, surprisal_tok, [[0, 1]],
+        weights_per_word=[[1.0 / 3.0, 2.0 / 3.0]])
+    assert valid.tolist() == [True]
+    # (1/3)*[3, 0] + (2/3)*[0, 9] = [1, 6]
+    assert np.allclose(lat[0].toarray(), [[1.0, 6.0]])
+    assert np.isclose(surp[0], 7.0)
+
+
+def test_equal_weights_match_unweighted_mean():
+    token_lat = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    surprisal_tok = np.array([1.0, 5.0], dtype=np.float32)
+    lat_u, surp_u, valid_u, _ = aggregate_owned_token_sae(
+        token_lat, surprisal_tok, [[0, 1]])
+    lat_w, surp_w, valid_w, _ = aggregate_owned_token_sae(
+        token_lat, surprisal_tok, [[0, 1]],
+        weights_per_word=[[1.0, 1.0]])
+    assert valid_u.tolist() == valid_w.tolist() == [True]
+    assert np.array_equal(lat_u.toarray(), lat_w.toarray())
+    assert np.isclose(surp_u[0], surp_w[0])
+
+
+def test_shared_ownership_appends_v2_tag():
+    args = parse_args([
+        "--preset", "qwen35_4b_mat_l15",
+        "--ownership", "shared_char_weighted",
+    ])
+    assert args.ownership == "shared_char_weighted"
+    assert args.feature_tag == "sae_qwen35_4b_mat_l15_v2"
+    plain = parse_args(["--preset", "qwen35_4b_mat_l15"])
+    assert plain.ownership == "unique_final_word"
+    assert plain.feature_tag == "sae_qwen35_4b_mat_l15"
+
+
 def test_build_section_text_spans():
     import pandas as pd
     wt = pd.DataFrame({"word": ["当", "我", "们"]})
@@ -131,5 +199,9 @@ if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         test_tagged_surprisal_paths_do_not_collide(_P(d))
+    test_shared_char_weighted_de_shihou()
+    test_shared_weight_normalized_mean()
+    test_equal_weights_match_unweighted_mean()
+    test_shared_ownership_appends_v2_tag()
     test_build_section_text_spans()
     print("All token-ownership tests passed.")

@@ -90,7 +90,9 @@ ECS_DISTANCE_REGRESSION = TAX_REPORTS / "ecs_distance_regression.txt"
 
 # ── Augmented Sparse Encoding (Lepori et al.) ────────────────────────────────
 # SAE-feature + surprisal interpretable encoding models.
-SAE_ROOT = RESULTS_ROOT / "sparse_encoding"
+# SAE_RESULTS_DIRNAME=sparse_encoding_v2 sends regression tables/reports to the
+# v2 root. The default stays the v1 directory.
+SAE_ROOT = RESULTS_ROOT / os.environ.get("SAE_RESULTS_DIRNAME", "sparse_encoding")
 SAE_TABLES = SAE_ROOT / "tables"
 SAE_REPORTS = SAE_ROOT / "reports"
 SAE_FIGURES = SAE_ROOT / "figures"

@@ -13,10 +13,17 @@ adapted to word-locked iEEG on running Chinese speech.
 
 Token → word alignment (repaired)
 ---------------------------------
-Each LM token has **exactly one owner**: the final overlapping segmented word
-(the word containing the token's last character). Tokens are never shared
-across adjacent word rows. Words with no owned tokens are marked invalid and
-excluded downstream (no neighbor duplication, no surprisal imputation).
+Default (``unique_final_word``): each LM token has **exactly one owner**, the
+final overlapping segmented word (the word containing the token's last
+character). Tokens are never shared across adjacent word rows. Words with no
+owned tokens are marked invalid and excluded downstream (no neighbor
+duplication, no surprisal imputation).
+
+``--ownership shared_char_weighted`` (v2): a token that overlaps several words
+contributes to each of them, weighted by the fraction of the token's characters
+inside that word. The word vector is the weight-normalized mean of those SAE
+activations (still SAE-then-mean). Outputs use a ``_v2`` feature tag so v1
+files are left in place.
 
 Aggregation order matches Lepori: encode each token residual with the SAE
 first, then average SAE activations over tokens owned by a word. Surprisal is
@@ -127,6 +134,23 @@ DEVICE = "cuda"
 DTYPE = "bfloat16"
 WORD_COL = "word"
 
+# Default keeps the repaired unique-owner rule. v2 shares character mass.
+OWNERSHIP_UNIQUE = "unique_final_word"
+OWNERSHIP_SHARED = "shared_char_weighted"
+OWNERSHIP_CHOICES = (OWNERSHIP_UNIQUE, OWNERSHIP_SHARED)
+OWNERSHIP_META = {
+    OWNERSHIP_UNIQUE: "unique_final_overlapping_word",
+    OWNERSHIP_SHARED: "shared_char_weighted",
+}
+
+
+def feature_tag_for_ownership(tag: str, ownership: str) -> str:
+    """v2 tags end in ``_v2`` so shared-ownership extracts cannot replace v1."""
+    tag = str(tag)
+    if ownership == OWNERSHIP_SHARED and not tag.endswith("_v2"):
+        return f"{tag}_v2"
+    return tag
+
 
 # ======================================================================
 # Word / token alignment  (CPU-only, no model needed)
@@ -200,15 +224,104 @@ def assign_tokens_to_words(
     return tokens_per_word, token_owner
 
 
+@dataclass
+class SharedTokenAssignment:
+    """Character-weighted token contributions (a token may hit several words)."""
+
+    tokens_per_word: List[List[int]]
+    weights_per_word: List[List[float]]
+    shared_token: List[bool]
+    n_shared_tokens: int
+
+
+def assign_tokens_shared_char_weighted(
+    offsets: List[Tuple[int, int]],
+    word_spans: List[Tuple[int, int]],
+) -> SharedTokenAssignment:
+    """Give every overlapped word a share of the token.
+
+    Weight on word *w* is the number of token characters that fall inside *w*,
+    divided by the token's character length. A word's ``shared_token`` flag is
+    true when any contributing token also overlaps a different word.
+    """
+    n_words = len(word_spans)
+    tokens_per_word: List[List[int]] = [[] for _ in range(n_words)]
+    weights_per_word: List[List[float]] = [[] for _ in range(n_words)]
+    shared_token = [False] * n_words
+    n_shared_tokens = 0
+
+    wi = 0
+    for ti, (ts, te) in enumerate(offsets):
+        if te <= ts:
+            continue
+        span = float(te - ts)
+        while wi < n_words and word_spans[wi][1] <= ts:
+            wi += 1
+        overlaps: List[Tuple[int, float]] = []
+        wj = wi
+        while wj < n_words and word_spans[wj][0] < te:
+            ws, we = word_spans[wj]
+            ov = min(te, we) - max(ts, ws)
+            if ov > 0:
+                overlaps.append((wj, float(ov) / span))
+            wj += 1
+        is_shared = len(overlaps) > 1
+        if is_shared:
+            n_shared_tokens += 1
+        for word_i, weight in overlaps:
+            tokens_per_word[word_i].append(ti)
+            weights_per_word[word_i].append(weight)
+            if is_shared:
+                shared_token[word_i] = True
+    return SharedTokenAssignment(
+        tokens_per_word=tokens_per_word,
+        weights_per_word=weights_per_word,
+        shared_token=shared_token,
+        n_shared_tokens=n_shared_tokens,
+    )
+
+
+def _shared_ownership_mismatches(
+    tokens_per_word: List[List[int]],
+    weights_per_word: List[List[float]],
+) -> int:
+    """Words whose token/weight lists are inconsistent, or whose token mass ≠ 1."""
+    n = len(tokens_per_word)
+    if len(weights_per_word) != n:
+        return n
+    from collections import defaultdict
+
+    mass: Dict[int, float] = defaultdict(float)
+    bad_words = set()
+    for wi, (toks, wts) in enumerate(zip(tokens_per_word, weights_per_word)):
+        if len(toks) != len(wts) or len(toks) != len(set(toks)):
+            bad_words.add(wi)
+            continue
+        for tok, weight in zip(toks, wts):
+            if not np.isfinite(weight) or weight <= 0:
+                bad_words.add(wi)
+                break
+            mass[int(tok)] += float(weight)
+    bad_tokens = {tok for tok, total in mass.items() if abs(total - 1.0) > 1e-5}
+    if bad_tokens:
+        for wi, toks in enumerate(tokens_per_word):
+            if any(int(tok) in bad_tokens for tok in toks):
+                bad_words.add(wi)
+    return int(len(bad_words))
+
+
 def alignment_report(
     tokens_per_word: List[List[int]],
     token_owner: Optional[List[int]] = None,
+    weights_per_word: Optional[List[List[float]]] = None,
 ) -> Dict[str, float]:
     counts = np.array([len(t) for t in tokens_per_word], dtype=int)
     n = len(counts)
     owned_cov = float(100.0 * np.mean(counts > 0)) if n else 0.0
     shared = 0
-    if token_owner is not None:
+    if weights_per_word is not None:
+        shared = _shared_ownership_mismatches(tokens_per_word, weights_per_word)
+    elif token_owner is not None:
         # Each positive owner index should appear exactly once per owned token;
         # rebuild multiset vs tokens_per_word to detect accidental sharing.
         rebuilt = [[] for _ in range(n)]
@@ -487,16 +600,43 @@ def encode_tokens_with_sae(
     return out
 
 
+def _reduce_vectors(rows: np.ndarray, weights: Optional[np.ndarray], aggregation: str):
+    """Unweighted mean, or weight-normalized mean. Equal weights use ``mean``."""
+    if aggregation == "last" or rows.shape[0] == 1:
+        return rows[-1] if aggregation == "last" else rows.mean(axis=0)
+    if weights is None:
+        return rows.mean(axis=0)
+    w = np.asarray(weights, dtype=np.float64)
+    if w.shape[0] != rows.shape[0]:
+        raise ValueError(
+            f"weight length {w.shape[0]} != n token rows {rows.shape[0]}")
+    if not np.isfinite(w).all() or float(w.sum()) <= 0:
+        raise ValueError("token weights must be finite and positive")
+    if np.allclose(w, w[0]):
+        return rows.mean(axis=0)
+    return np.average(rows, axis=0, weights=w).astype(np.float32)
+
+
+def _reduce_scalar(values: np.ndarray, weights: Optional[np.ndarray]) -> float:
+    if weights is None or values.size == 1 or np.allclose(weights, weights[0]):
+        return float(np.mean(values))
+    return float(np.average(values, weights=np.asarray(weights, dtype=np.float64)))
+
+
 def aggregate_owned_token_sae(
     token_latents: np.ndarray,
     surprisal_tok: np.ndarray,
     tokens_per_word: List[List[int]],
     aggregation: str = "mean",
+    weights_per_word: Optional[List[List[float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
-    """Average SAE activations / surprisal over uniquely owned tokens.
+    """Average SAE activations / surprisal over owned tokens.
 
-    Words with no owned tokens (or no finite owned activations) are invalid.
-    No residual imputation and no surprisal mean-imputation are performed.
+    ``weights_per_word`` is the per-token character fraction for
+    ``shared_char_weighted``. The word vector is the weight-normalized mean
+    (equal weights reduce to the v1 unweighted mean). Words with no owned
+    tokens, or no finite surprisal, are invalid. No residual imputation and
+    no surprisal mean-imputation are performed.
     """
     from scipy import sparse
 
@@ -511,22 +651,27 @@ def aggregate_owned_token_sae(
     for wi, toks in enumerate(tokens_per_word):
         if not toks:
             continue
-        rows = token_latents[toks]
+        tok_idx = np.asarray(toks, dtype=int)
+        rows = token_latents[tok_idx]
         good = np.isfinite(rows).all(axis=1)
         rows = rows[good]
         if rows.shape[0] == 0:
             continue
+        w = None
+        if weights_per_word is not None:
+            w = np.asarray(weights_per_word[wi], dtype=np.float64)[good]
+            if w.size == 0 or float(np.sum(w)) <= 0:
+                continue
         token_l0s.extend(float(np.count_nonzero(r)) for r in rows)
-        if aggregation == "last":
-            word_lat[wi] = rows[-1]
-        else:
-            word_lat[wi] = rows.mean(axis=0)
+        word_lat[wi] = _reduce_vectors(rows, w, aggregation)
         valid[wi] = True
 
-        svals = surprisal_tok[np.asarray(toks)[good]]
-        svals = svals[np.isfinite(svals)]
+        s_all = surprisal_tok[tok_idx[good]]
+        s_ok = np.isfinite(s_all)
+        svals = s_all[s_ok]
         if svals.size:
-            word_surp[wi] = float(np.mean(svals))
+            w_s = None if w is None else w[s_ok]
+            word_surp[wi] = _reduce_scalar(svals, w_s)
         else:
             # Owned tokens exist but no finite NLL (e.g. first token) → invalid.
             valid[wi] = False
@@ -559,8 +704,9 @@ def aggregate_owned_token_dense(
     token_mat: np.ndarray,
     tokens_per_word: List[List[int]],
     aggregation: str = "mean",
+    weights_per_word: Optional[List[List[float]]] = None,
 ) -> np.ndarray:
-    """Mean (or last) dense vector over uniquely owned tokens. Invalid rows stay 0."""
+    """Mean (or last) dense vector over owned tokens. Invalid rows stay 0."""
     n_words = len(tokens_per_word)
     d = int(token_mat.shape[1])
     out = np.zeros((n_words, d), dtype=np.float32)
@@ -572,7 +718,12 @@ def aggregate_owned_token_dense(
         rows = rows[good]
         if rows.shape[0] == 0:
             continue
-        out[wi] = rows[-1] if aggregation == "last" else rows.mean(axis=0)
+        w = None
+        if weights_per_word is not None:
+            w = np.asarray(weights_per_word[wi], dtype=np.float64)[good]
+            if w.size == 0 or float(np.sum(w)) <= 0:
+                continue
+        out[wi] = _reduce_vectors(rows, w, aggregation)
     return out
 
 
@@ -604,19 +755,37 @@ def process_section(
             f"Tokenizer for {args.model_name} did not return offset_mapping "
             "(need a fast tokenizer)."
         )
-    tokens_per_word, token_owner = assign_tokens_to_words(
-        enc["offset_mapping"], sect.word_spans)
-    rep = alignment_report(tokens_per_word, token_owner)
+    ownership = getattr(args, "ownership", OWNERSHIP_UNIQUE)
+    weights_per_word = None
+    shared_flags = None
+    n_shared_tokens = 0
+    if ownership == OWNERSHIP_SHARED:
+        shared = assign_tokens_shared_char_weighted(
+            enc["offset_mapping"], sect.word_spans)
+        tokens_per_word = shared.tokens_per_word
+        weights_per_word = shared.weights_per_word
+        shared_flags = np.asarray(shared.shared_token, dtype=bool)
+        n_shared_tokens = int(shared.n_shared_tokens)
+        rep = alignment_report(tokens_per_word, weights_per_word=weights_per_word)
+        if rep["ownership_mismatch_words"] != 0:
+            raise RuntimeError(
+                f"shared-token assignment mismatches: {rep['ownership_mismatch_words']}")
+    else:
+        tokens_per_word, token_owner = assign_tokens_to_words(
+            enc["offset_mapping"], sect.word_spans)
+        rep = alignment_report(tokens_per_word, token_owner)
+        # Ownership uniqueness invariant
+        owned_counts = np.zeros(sect.n_words, dtype=int)
+        for o in token_owner:
+            if o >= 0:
+                owned_counts[o] += 1
+        assert all(
+            len(tokens_per_word[i]) == owned_counts[i] for i in range(sect.n_words)
+        )
+    rep["shared_token_count"] = int(n_shared_tokens)
+    rep["shared_token_word_count"] = (
+        int(shared_flags.sum()) if shared_flags is not None else 0)
     print(f"[section {section_id}] {rep}")
-
-    # Ownership uniqueness invariant
-    owned_counts = np.zeros(sect.n_words, dtype=int)
-    for o in token_owner:
-        if o >= 0:
-            owned_counts[o] += 1
-    assert all(
-        len(tokens_per_word[i]) == owned_counts[i] for i in range(sect.n_words)
-    )
 
     if args.dry_run_alignment:
         return rep
@@ -630,7 +799,8 @@ def process_section(
     )
     tag = args.feature_tag
     word_resid = aggregate_owned_token_dense(
-        resid, tokens_per_word, aggregation=args.aggregation)
+        resid, tokens_per_word, aggregation=args.aggregation,
+        weights_per_word=weights_per_word)
 
     if getattr(args, "resid_only", False):
         valid_path = sec_dir / f"X_word_{tag}_valid.npy"
@@ -658,11 +828,15 @@ def process_section(
     )
     latents, word_surp, valid, stats = aggregate_owned_token_sae(
         token_lat, surprisal_tok, tokens_per_word, aggregation=args.aggregation,
+        weights_per_word=weights_per_word,
     )
     word_resid[~valid] = 0.0
 
     from scipy import sparse
 
+    if ownership == OWNERSHIP_SHARED and not str(tag).endswith("_v2"):
+        raise RuntimeError(
+            f"shared_char_weighted refused to write non-v2 tag {tag!r}")
     sparse.save_npz(sec_dir / f"X_word_{tag}.npz", latents)
     d_sae = latents.shape[1]
     with open(sec_dir / f"X_word_{tag}_feature_names.txt", "w") as f:
@@ -675,6 +849,8 @@ def process_section(
         f.write(f"surprisal_{tag}\n")
     np.save(sec_dir / f"X_word_{tag}_valid.npy", valid.astype(np.bool_))
     np.save(sec_dir / f"X_word_{tag}_resid.npy", word_resid.astype(np.float32))
+    if shared_flags is not None:
+        np.save(sec_dir / f"X_word_{tag}_shared_token.npy", shared_flags)
 
     meta = {
         "model_name": args.model_name,
@@ -685,7 +861,10 @@ def process_section(
         "d_model": int(word_resid.shape[1]),
         "aggregation": args.aggregation,
         "aggregation_order": "sae_then_mean",
-        "token_ownership": "unique_final_overlapping_word",
+        "token_ownership": OWNERSHIP_META.get(ownership, ownership),
+        "coverage_pct": rep.get("coverage_pct"),
+        "shared_token_count": int(n_shared_tokens),
+        "shared_token_word_count": rep["shared_token_word_count"],
         "context_len": args.context_len,
         "stride": args.stride,
         "scale_by_decoder": bool(args.scale_by_decoder),
@@ -721,6 +900,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--sae_layer", type=int, default=SAE_LAYER)
     p.add_argument("--feature_tag", default=FEATURE_TAG)
     p.add_argument("--aggregation", choices=["last", "mean"], default=AGGREGATION)
+    p.add_argument(
+        "--ownership", choices=list(OWNERSHIP_CHOICES), default=OWNERSHIP_UNIQUE,
+        help="unique_final_word (default, v1) or shared_char_weighted (v2). "
+             "shared_char_weighted appends _v2 to --feature_tag and does not "
+             "overwrite v1 npz/meta.",
+    )
     p.add_argument("--context_len", type=int, default=CONTEXT_LEN)
     p.add_argument("--stride", type=int, default=STRIDE)
     p.add_argument("--scale_by_decoder", action="store_true", default=SCALE_BY_DECODER)
@@ -749,6 +934,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     args = p.parse_args(argv)
     args.matryoshka_widths = None
     apply_preset(args, argv if argv is not None else sys.argv[1:])
+    args.feature_tag = feature_tag_for_ownership(args.feature_tag, args.ownership)
     return args
 
 

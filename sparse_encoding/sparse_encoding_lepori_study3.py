@@ -889,6 +889,7 @@ def write_report(
     path: Path,
     resid: Optional[pd.DataFrame] = None,
     named: Optional[pd.DataFrame] = None,
+    model_tags: Optional[Sequence[str]] = None,
 ):
     a: List[str] = []
     add = a.append
@@ -946,7 +947,8 @@ def write_report(
     add("-" * 72)
     add("CLAIM STATUS vs Lepori Fig. 4A")
     add("-" * 72)
-    for tag in (GEMMA_TAG, QWEN_TAG, QWEN35_TAG):
+    tags = tuple(model_tags) if model_tags else (GEMMA_TAG, QWEN_TAG, QWEN35_TAG)
+    for tag in tags:
         if stats.empty or tag not in set(stats["feature_tag"]):
             continue
         add(f"\n[{tag}]")
@@ -1110,7 +1112,42 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--n_perm", type=int, default=N_PERM)
     p.add_argument("--y_cut", type=float, default=TEMPORAL_Y_CUT)
+    p.add_argument(
+        "--tag_suffix", default="",
+        help="Appended to Gemma / Qwen3-8B / Qwen3.5 tags when reading CSVs. "
+             "Use _v2 for shared-token ownership. Empty keeps v1 names.",
+    )
     return p.parse_args()
+
+
+def _tag_suffix(raw: str) -> str:
+    suffix = str(raw or "")
+    if suffix and not suffix.startswith("_"):
+        return "_" + suffix
+    return suffix
+
+
+def _feature_csv(tag: str, *fallbacks: Path) -> Path:
+    candidates = [
+        ap.SAE_TABLES / f"sparse_encoding_features_{tag}_all_channels.csv",
+        ap.SAE_TABLES / f"sparse_encoding_features_{tag}.csv",
+        *fallbacks,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0]
+
+
+def _resid_csv(kind: str, suffix: str) -> Path:
+    defaults = {
+        "qwen": ap.SAE_STUDY3_QWEN_RESID,
+        "gemma": ap.SAE_STUDY3_GEMMA_RESID,
+        "qwen35": ap.SAE_STUDY3_QWEN35_RESID,
+    }
+    if not suffix:
+        return defaults[kind]
+    return ap.SAE_TABLES / f"sparse_encoding_dense_baselines_{kind}{suffix}_resid_lang.csv"
 
 
 def main():
@@ -1118,10 +1155,14 @@ def main():
     ap.ensure_pipeline_dirs()
     global TEMPORAL_Y_CUT
     TEMPORAL_Y_CUT = float(args.y_cut)
+    suffix = _tag_suffix(args.tag_suffix)
+    gemma_tag = GEMMA_TAG + suffix
+    qwen_tag = QWEN_TAG + suffix
+    qwen35_tag = QWEN35_TAG + suffix
 
-    gemma = load_sae_cohort(GEMMA_TAG)
-    qwen = load_sae_cohort(QWEN_TAG)
-    qwen35 = try_load_sae_cohort(QWEN35_TAG)
+    gemma = load_sae_cohort(gemma_tag)
+    qwen = load_sae_cohort(qwen_tag)
+    qwen35 = try_load_sae_cohort(qwen35_tag)
 
     elec_cols = [
         "subject", "channel", "region", "region_a", "region_b",
@@ -1145,12 +1186,12 @@ def main():
     if qwen35 is not None and len(qwen35) >= len(gemma):
         cov_src = qwen35
     cov = coverage_table(cov_src)
-    summary_parts = [froi_summary(gemma, GEMMA_TAG), froi_summary(qwen, QWEN_TAG)]
-    stats_parts = [froi_stats(gemma, GEMMA_TAG, args.n_perm),
-                   froi_stats(qwen, QWEN_TAG, args.n_perm)]
+    summary_parts = [froi_summary(gemma, gemma_tag), froi_summary(qwen, qwen_tag)]
+    stats_parts = [froi_stats(gemma, gemma_tag, args.n_perm),
+                   froi_stats(qwen, qwen_tag, args.n_perm)]
     if qwen35 is not None:
-        summary_parts.append(froi_summary(qwen35, QWEN35_TAG))
-        stats_parts.append(froi_stats(qwen35, QWEN35_TAG, args.n_perm))
+        summary_parts.append(froi_summary(qwen35, qwen35_tag))
+        stats_parts.append(froi_stats(qwen35, qwen35_tag, args.n_perm))
     summaries = pd.concat(summary_parts, ignore_index=True)
     summaries.to_csv(ap.SAE_STUDY3_SUMMARY_TABLE, index=False)
 
@@ -1162,52 +1203,50 @@ def main():
         dense.to_csv(ap.SAE_STUDY3_DENSE_TABLE, index=False)
 
     resid_parts = [
-        residual_vs_sae(qwen, ap.SAE_STUDY3_QWEN_RESID, QWEN_TAG),
-        residual_vs_sae(gemma, ap.SAE_STUDY3_GEMMA_RESID, GEMMA_TAG),
+        residual_vs_sae(qwen, _resid_csv("qwen", suffix), qwen_tag),
+        residual_vs_sae(gemma, _resid_csv("gemma", suffix), gemma_tag),
     ]
     if qwen35 is not None:
         resid_parts.append(
-            residual_vs_sae(qwen35, ap.SAE_STUDY3_QWEN35_RESID, QWEN35_TAG))
+            residual_vs_sae(qwen35, _resid_csv("qwen35", suffix), qwen35_tag))
     resid_parts = [p for p in resid_parts if p is not None and not p.empty]
     resid = (pd.concat(resid_parts, ignore_index=True)
              if resid_parts else pd.DataFrame())
     if not resid.empty:
         resid.to_csv(ap.SAE_TABLES / "lepori_study3_resid_vs_sae.csv", index=False)
 
-    gemma_feat = ap.SAE_TABLES / f"sparse_encoding_features_{GEMMA_TAG}.csv"
-    qwen_feat = ap.SAE_FEATURES_QWEN_ALL
+    gemma_feat = _feature_csv(gemma_tag)
+    qwen_feat = _feature_csv(qwen_tag, ap.SAE_FEATURES_QWEN_ALL)
     prev_g, bins_g, jac_g = feature_sharing(gemma, gemma_feat)
     prev_q, bins_q, jac_q = feature_sharing(
         qwen, qwen_feat, matryoshka=False)
     prev_q35, bins_q35, jac_q35 = pd.DataFrame(), pd.DataFrame(), {}
-    q35_feat = ap.SAE_FEATURES_QWEN35_ALL
+    q35_feat = _feature_csv(qwen35_tag, ap.SAE_FEATURES_QWEN35_ALL)
     if qwen35 is not None:
-        if not q35_feat.exists():
-            q35_feat = ap.SAE_TABLES / f"sparse_encoding_features_{QWEN35_TAG}.csv"
         prev_q35, bins_q35, jac_q35 = feature_sharing(
             qwen35, q35_feat, matryoshka=True, bins=QWEN35_MATRYOSHKA_BINS)
     prev_parts = []
     if not prev_g.empty:
-        prev_parts.append(prev_g.assign(feature_tag=GEMMA_TAG))
+        prev_parts.append(prev_g.assign(feature_tag=gemma_tag))
     if not prev_q.empty:
-        prev_parts.append(prev_q.assign(feature_tag=QWEN_TAG))
+        prev_parts.append(prev_q.assign(feature_tag=qwen_tag))
     if not prev_q35.empty:
-        prev_parts.append(prev_q35.assign(feature_tag=QWEN35_TAG))
+        prev_parts.append(prev_q35.assign(feature_tag=qwen35_tag))
     prev = pd.concat(prev_parts, ignore_index=True) if prev_parts else pd.DataFrame()
     if not prev.empty:
         prev.to_csv(ap.SAE_STUDY3_FEATURE_TABLE, index=False)
 
     bin_parts = []
     if not bins_g.empty:
-        bin_parts.append(bins_g.assign(feature_tag=GEMMA_TAG))
+        bin_parts.append(bins_g.assign(feature_tag=gemma_tag))
     if not bins_q.empty:
-        bin_parts.append(bins_q.assign(feature_tag=QWEN_TAG))
+        bin_parts.append(bins_q.assign(feature_tag=qwen_tag))
     if not bins_q35.empty:
-        bin_parts.append(bins_q35.assign(feature_tag=QWEN35_TAG))
+        bin_parts.append(bins_q35.assign(feature_tag=qwen35_tag))
     bins = pd.concat(bin_parts, ignore_index=True) if bin_parts else pd.DataFrame()
-    jaccard_meta = {GEMMA_TAG: jac_g, QWEN_TAG: jac_q}
+    jaccard_meta = {gemma_tag: jac_g, qwen_tag: jac_q}
     if jac_q35:
-        jaccard_meta[QWEN35_TAG] = jac_q35
+        jaccard_meta[qwen35_tag] = jac_q35
 
     bin_refits = load_bin_refits()
     out_bins = bins.copy()
@@ -1225,12 +1264,12 @@ def main():
                 "sparse_encoding_features", "sparse_encoding_feature_words", 1))
 
     named_parts.append(named_latent_table(
-        gemma, gemma_feat, _words_for(gemma_feat), GEMMA_TAG))
+        gemma, gemma_feat, _words_for(gemma_feat), gemma_tag))
     named_parts.append(named_latent_table(
-        qwen, qwen_feat, _words_for(qwen_feat), QWEN_TAG))
+        qwen, qwen_feat, _words_for(qwen_feat), qwen_tag))
     if qwen35 is not None:
         named_parts.append(named_latent_table(
-            qwen35, q35_feat, _words_for(q35_feat), QWEN35_TAG))
+            qwen35, q35_feat, _words_for(q35_feat), qwen35_tag))
     named_parts = [p for p in named_parts if p is not None and not p.empty]
     named = (pd.concat(named_parts, ignore_index=True, sort=False)
              if named_parts else pd.DataFrame())
@@ -1240,7 +1279,7 @@ def main():
     write_report(
         cov, summaries, stats, dense, prev, bins,
         bin_refits, jaccard_meta, ap.SAE_STUDY3_REPORT, resid=resid,
-        named=named,
+        named=named, model_tags=(gemma_tag, qwen_tag, qwen35_tag),
     )
 
 
