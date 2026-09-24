@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Shared-token ownership v2: extract + the v1 regression chain.
+# Shared-token ownership v2 for the Qwen backbones only.
+# Primary: Qwen3.5-4B-Base Matryoshka L15. Companion: Qwen3-8B L18.
+# Gemma-2-2B is not extracted or regressed.
 # Writes X_word_<tag>_v2.* next to v1 features and tables under
 # group_encoding_results/sparse_encoding_v2/. Does not overwrite v1 npz/meta
 # or v1 sparse_encoding tables.
@@ -67,11 +69,10 @@ extract_preset() {
 
 echo "=== $(date -Iseconds) shared-ownership alignment QC ==="
 "${EXTRACT_PY}" -m sparse_encoding.sparse_encoding_validate \
-  --stage align --models gemma qwen qwen35 \
+  --stage align --models qwen qwen35 \
   --ownership shared_char_weighted
 
 extract_preset qwen35_4b_mat_l15 1 2 3
-extract_preset gemma2_2b_mat_l12 1 2 3
 extract_preset qwen3_8b_l18 1 2 3
 
 regress_cohort_lang() {
@@ -104,28 +105,20 @@ regress_bin() {
 }
 
 QWEN35="sae_qwen35_4b_mat_l15_v2"
-GEMMA="sae_gemma2_2b_mat_l12_v2"
 QWEN="sae_qwen3_8b_l18_v2"
 
 regress_cohort_lang "${QWEN35}"
-regress_cohort_lang "${GEMMA}"
 regress_cohort_lang "${QWEN}"
 
 regress_bin "${QWEN35}" 0 2048 "${N_JOBS}"
 regress_bin "${QWEN35}" 2048 "" "${N_JOBS_WIDE}"
 regress_bin "${QWEN35}" 2048 16384 "${N_JOBS_WIDE}"
 regress_bin "${QWEN35}" 16384 "" "${N_JOBS_WIDE}"
-regress_bin "${GEMMA}" 0 128 "${N_JOBS}"
-regress_bin "${GEMMA}" 128 "" "${N_JOBS}"
 
 echo "=== $(date -Iseconds) residual baselines ==="
 "${REGRESS_PY}" -m sparse_encoding.sparse_encoding_dense_baseline \
   --features "${QWEN35}_resid" --surprisal_tag "${QWEN35}" \
   --with_surprisal --lang_only --out_suffix _qwen35_v2_resid \
-  --n_jobs 1 --resume
-"${REGRESS_PY}" -m sparse_encoding.sparse_encoding_dense_baseline \
-  --features "${GEMMA}_resid" --surprisal_tag "${GEMMA}" \
-  --with_surprisal --lang_only --out_suffix _gemma_v2_resid \
   --n_jobs 1 --resume
 "${REGRESS_PY}" -m sparse_encoding.sparse_encoding_dense_baseline \
   --features "${QWEN}_resid" --surprisal_tag "${QWEN}" \
@@ -140,6 +133,7 @@ echo "=== $(date -Iseconds) Qwen3.5 qualitative (bin occupancy) ==="
   --suffix "_${QWEN35}_all_channels"
 
 echo "=== $(date -Iseconds) Study 3 analogue ==="
-"${REGRESS_PY}" -m sparse_encoding.sparse_encoding_lepori_study3 --tag_suffix _v2
+"${REGRESS_PY}" -m sparse_encoding.sparse_encoding_lepori_study3 \
+  --tag_suffix _v2 --skip_gemma
 
 echo "=== ALL DONE $(date -Iseconds) ==="
