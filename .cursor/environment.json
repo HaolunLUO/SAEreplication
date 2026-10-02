@@ -1,0 +1,4 @@
+{
+  "name": "SAEreplication",
+  "install": "bash .cursor/install.sh"
+}

@@ -7,7 +7,9 @@ venv/
 .env*
 .idea/
 .vscode/
-.cursor/
+.cursor/*
+!.cursor/environment.json
+!.cursor/install.sh
 *.swp
 *~
 .DS_Store
