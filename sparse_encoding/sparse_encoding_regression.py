@@ -244,11 +244,17 @@ def select_alpha(X, y) -> float:
     return float(m.alpha_)
 
 
-def compute_support_features(X, y, k_best: int = LASSO_K_BEST) -> Optional[np.ndarray]:
+def compute_support_features(
+    X, y, k_best: int = LASSO_K_BEST, *, dense: bool = False,
+) -> Optional[np.ndarray]:
     """L1 feature selection with an F-test prescreen. Returns a boolean mask.
 
     Ported from the reference repo's
     ``regression_utils.compute_support_features``.
+
+    ``dense=True`` densifies spaces that are already narrower than ``k_best``
+    (the residual stream). LassoCV hyperparameters stay the ported settings.
+    The SAE path (wider than ``k_best``) is unchanged.
     """
     n_feat = X.shape[1]
     if n_feat > k_best:
@@ -256,7 +262,13 @@ def compute_support_features(X, y, k_best: int = LASSO_K_BEST) -> Optional[np.nd
         Xs = selector.fit_transform(X, y)
         screen_mask = selector.get_support()
     else:
-        Xs = X
+        if dense:
+            Xs = np.ascontiguousarray(
+                X.toarray() if sparse.issparse(X) else np.asarray(X),
+                dtype=np.float64,
+            )
+        else:
+            Xs = X
         screen_mask = np.ones(n_feat, dtype=bool)
 
     reg = LassoCV(
@@ -276,7 +288,7 @@ def compute_support_features(X, y, k_best: int = LASSO_K_BEST) -> Optional[np.nd
 
 
 def compute_joint_support(
-    X, surp, y, k_best: int = LASSO_K_BEST,
+    X, surp, y, k_best: int = LASSO_K_BEST, *, dense: bool = False,
 ) -> np.ndarray:
     """F-test + Lasso where surprisal competes in the same candidate pool as ``X``.
 
@@ -292,11 +304,21 @@ def compute_joint_support(
     surprisal-only for that fold.
     """
     n_feat = X.shape[1]
-    X_sp = X if sparse.issparse(X) else sparse.csr_matrix(X)
-    surp_col = sparse.csr_matrix(np.asarray(surp, dtype=np.float64).reshape(-1, 1))
-    X_joint = sparse.hstack([X_sp, surp_col]).tocsr()
-
-    support_joint = compute_support_features(X_joint, y, k_best=k_best)
+    surp_vec = np.asarray(surp, dtype=np.float64).reshape(-1, 1)
+    # Densify only when the F-test would be skipped. Wide SAE stays sparse.
+    if dense and n_feat <= k_best:
+        Xd = X.toarray() if sparse.issparse(X) else np.asarray(X)
+        X_joint = np.ascontiguousarray(
+            np.hstack([np.asarray(Xd, dtype=np.float64), surp_vec]),
+            dtype=np.float64,
+        )
+        support_joint = compute_support_features(
+            X_joint, y, k_best=k_best, dense=True)
+    else:
+        X_sp = X if sparse.issparse(X) else sparse.csr_matrix(X)
+        surp_col = sparse.csr_matrix(surp_vec)
+        X_joint = sparse.hstack([X_sp, surp_col]).tocsr()
+        support_joint = compute_support_features(X_joint, y, k_best=k_best)
     if support_joint is None:
         return np.zeros(n_feat, dtype=bool)
     return support_joint[:n_feat]
